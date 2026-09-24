@@ -475,6 +475,68 @@ async function testPurchase() {
   await app.k.close()
 }
 
+async function testPurchaseConcurrency() {
+  console.log('— 采购并发验收：同一采购单按 po 串行，累计入库不超审批数量、PO/批次/库存账一致 —')
+  const db = tmpDb('purchase-race')
+  const app = await createApp({ dbFile: db, autoResume: false })
+  const ops = staffCtx(app, 'm-star-ops')
+  const fin = staffCtx(app, 'm-star-fin')
+  const shipStaff = staffCtx(app, 'm-star-ship')
+  const g = app.k.state.goods.find((x) => x.id === 'g3')
+  const remain0 = g.remain
+  const stock0 = g.stock
+
+  // 场景 1：两笔并发验收各 6（合计 12 > 审批 10）→ 恰好一笔成功，另一笔 OVER_INBOUND
+  const po = await app.purchase.createOrder({ targetType: 'goods', targetId: 'g3', qty: 10, reason: '并发验收' }, ops)
+  await app.purchase.reviewOrder(po.id, true, '', fin)
+  const r = await Promise.all([
+    settled(app.purchase.inbound(po.id, { qty: 6 }, shipStaff)),
+    settled(app.purchase.inbound(po.id, { qty: 6 }, shipStaff))
+  ])
+  const ok = r.filter((x) => x.ok)
+  const rejected = r.filter((x) => !x.ok)
+  assert(ok.length === 1 && rejected.length === 1 && rejected[0].e.code === 'OVER_INBOUND',
+    `并发两笔 6（共 12>10）：恰好一笔入库、一笔 OVER_INBOUND（实际成功 ${ok.length}，拒绝码=${rejected[0]?.e.code}）`)
+  let row = app.k.state.purchaseOrders.find((x) => x.id === po.id)
+  let batchQty = app.k.state.inboundBatches.filter((b) => b.poId === po.id).reduce((n, b) => n + b.qty, 0)
+  assert(row.status === 'receiving' && row.inboundQty === 6 && batchQty === 6,
+    `PO 累计验收=批次合计=6（实际 PO ${row.inboundQty}/批次 ${batchQty}）`)
+  assert(g.remain === remain0 + 6 && g.stock === stock0 + 6,
+    `库存仅抬升 6（remain ${g.remain}/${remain0 + 6}，stock ${g.stock}/${stock0 + 6}）`)
+
+  // 场景 2：两笔并发全额验收（各 10）→ 一笔入满完结，一笔被拦截，无丢失更新导致的双抬库存
+  const po2 = await app.purchase.createOrder({ targetType: 'goods', targetId: 'g3', qty: 10, reason: '并发全额' }, ops)
+  await app.purchase.reviewOrder(po2.id, true, '', fin)
+  const r2 = await Promise.all([
+    settled(app.purchase.inbound(po2.id, { qty: 10 }, shipStaff)),
+    settled(app.purchase.inbound(po2.id, { qty: 10 }, shipStaff))
+  ])
+  const ok2 = r2.filter((x) => x.ok)
+  const rej2 = r2.filter((x) => !x.ok)
+  assert(ok2.length === 1 && rej2.length === 1 && ['OVER_INBOUND', 'STATE_DENIED'].includes(rej2[0].e.code),
+    `并发两笔全额 10：一笔入满、一笔拦截（实际成功 ${ok2.length}，拒绝码=${rej2[0]?.e.code}）`)
+  row = app.k.state.purchaseOrders.find((x) => x.id === po2.id)
+  batchQty = app.k.state.inboundBatches.filter((b) => b.poId === po2.id).reduce((n, b) => n + b.qty, 0)
+  assert(row.status === 'received' && row.inboundQty === 10 && batchQty === 10,
+    `PO 完结且累计=批次=10（实际 ${row.inboundQty}/${batchQty}）`)
+  assert(g.remain === remain0 + 16 && g.stock === stock0 + 16,
+    `两张采购单合计净入库 16，库存账与 PO 一致（remain ${g.remain}，stock ${g.stock}）`)
+
+  // 场景 3：5 笔并发各 4（审批 10）→ 恰好 2 笔成功（累计 8），其余 3 笔拦截，不超收
+  const po3 = await app.purchase.createOrder({ targetType: 'goods', targetId: 'g3', qty: 10, reason: '并发多笔' }, ops)
+  await app.purchase.reviewOrder(po3.id, true, '', fin)
+  const r3 = await Promise.all(Array.from({ length: 5 }, () =>
+    settled(app.purchase.inbound(po3.id, { qty: 4 }, shipStaff))))
+  assert(r3.filter((x) => x.ok).length === 2 && r3.filter((x) => !x.ok).length === 3,
+    `5 笔并发各 4：恰好 2 笔成功（累计 8）、3 笔拦截（实际成功 ${r3.filter((x) => x.ok).length}）`)
+  row = app.k.state.purchaseOrders.find((x) => x.id === po3.id)
+  batchQty = app.k.state.inboundBatches.filter((b) => b.poId === po3.id).reduce((n, b) => n + b.qty, 0)
+  assert(row.inboundQty === 8 && batchQty === 8 && g.remain === remain0 + 24 && g.stock === stock0 + 24,
+    `PO/批次=8 且库存账一致（PO ${row.inboundQty}，批次 ${batchQty}，remain ${g.remain}，stock ${g.stock}）`)
+
+  await app.k.close()
+}
+
 async function main() {
   await testConcurrency()
   await testIdempotency()
@@ -482,6 +544,7 @@ async function main() {
   await testReleaseCrashAndCrossDay()
   await testRecon()
   await testPurchase()
+  await testPurchaseConcurrency()
   await testRbac()
   await testWALRecovery()
   if (failed) {

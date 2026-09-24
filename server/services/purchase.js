@@ -4,10 +4,11 @@
 import { genId, BizError } from '../util.js'
 
 export class PurchaseService {
-  constructor(k, audit, inventory) {
+  constructor(k, audit, inventory, locks) {
     this.k = k
     this.audit = audit
     this.inventory = inventory
+    this.locks = locks
   }
 
   requireOrder(poId) {
@@ -119,7 +120,13 @@ export class PurchaseService {
   }
 
   // 分批验收入库（approved/receiving；实收 >0 且累计不超审批数量；幂等 effectId 防重复入账）
+  // 「读 inboundQty → 校验待收 → 抬库存 → 回写累计」跨多个 await，并发验收会基于同一
+  // 快照双双通过校验（累计入库超审批数量、PO 累计与库存账不一致），故按 po 键串行临界区。
   async inbound(poId, form, ctx) {
+    return this.locks.run(`po:${poId}`, () => this._inbound(poId, form, ctx))
+  }
+
+  async _inbound(poId, form, ctx) {
     const po = this.requireOrder(poId)
     if (!['approved', 'receiving'].includes(po.status)) {
       throw new BizError('STATE_DENIED', '仅已审批 / 验收中的采购单可验收入库', 409)
