@@ -432,6 +432,39 @@ async function testPurchase() {
   assert(dup instanceof BizError && dup.code === 'STATE_DENIED', '完结后重复验收被状态机拦截')
   assert(app.k.state.inboundBatches.filter((b) => b.poId === po.id).length === 2, '两批验收写入 append-only 台账')
 
+  // 并发验收：同一采购单两个并发批次在锁内串行，恰好一笔生效（累计入库不超审批数量）
+  const poRace = await app.purchase.createOrder({ targetType: 'goods', targetId: 'g3', qty: 10, reason: '并发验收回归' }, ops)
+  await app.purchase.reviewOrder(poRace.id, true, '', fin)
+  const g3r = () => app.k.state.goods.find((g) => g.id === 'g3')
+  const remainPre = g3r().remain
+  const stockPre = g3r().stock
+  const race = await Promise.all([
+    settled(app.purchase.inbound(poRace.id, { qty: 10 }, shipStaff)),
+    settled(app.purchase.inbound(poRace.id, { qty: 10 }, shipStaff))
+  ])
+  assert(race.filter((r) => r.ok).length === 1, `并发验收同一采购单：恰好一笔成功（实际 ${race.filter((r) => r.ok).length}）`)
+  assert(!race[0].ok && race[0].e.code === 'STATE_DENIED' || !race[1].ok && race[1].e.code === 'STATE_DENIED',
+    `并发败者被状态机拦截（实际 ${race.find((r) => !r.ok)?.e?.code}）`)
+  const poRaceAfter = app.k.state.purchaseOrders.find((x) => x.id === poRace.id)
+  assert(poRaceAfter.inboundQty === 10 && poRaceAfter.status === 'received', '并发后采购单 10/10 完结，未超收')
+  assert(g3r().remain === remainPre + 10 && g3r().stock === stockPre + 10, '库存仅抬升一次（审批 10 件，无重复入账）')
+  assert(app.k.state.inboundBatches.filter((b) => b.poId === poRace.id).length === 1, '验收台账仅一批')
+
+  // 并发部分验收：6+6 对审批 10，一笔入 6、另一笔被锁内重读的待收余量拦截
+  const poRace2 = await app.purchase.createOrder({ targetType: 'goods', targetId: 'g3', qty: 10, reason: '并发部分验收回归' }, ops)
+  await app.purchase.reviewOrder(poRace2.id, true, '', fin)
+  const remainPre2 = g3r().remain
+  const race2 = await Promise.all([
+    settled(app.purchase.inbound(poRace2.id, { qty: 6 }, shipStaff)),
+    settled(app.purchase.inbound(poRace2.id, { qty: 6 }, shipStaff))
+  ])
+  assert(race2.filter((r) => r.ok).length === 1, '并发部分验收：恰好一笔成功')
+  assert(race2.find((r) => !r.ok)?.e?.code === 'OVER_INBOUND',
+    `并发败者被超量校验拦截（实际 ${race2.find((r) => !r.ok)?.e?.code}）`)
+  const poRace2After = app.k.state.purchaseOrders.find((x) => x.id === poRace2.id)
+  assert(poRace2After.inboundQty === 6 && poRace2After.status === 'receiving', '并发后采购单 6/10 验收中，累计未超审批')
+  assert(g3r().remain === remainPre2 + 6, '库存仅抬升 6 件（与采购单累计入库一致）')
+
   // 缺货补发：把 g3 账面调到「仅剩 1 件」（stock 与已消耗保持勾稽，不制造盘亏）→ 兑完 → 补发缺货
   const consumedG3 = app.k.state.records.filter((r) => r.type === 'redeem' && r.goodsId === 'g3' && r.status !== 'revoked').length
   await app.k.commit([{ type: 'upsert', table: 'goods', row: { ...g3, remain: 1, stock: consumedG3 + 1 } }])

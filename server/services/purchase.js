@@ -4,10 +4,11 @@
 import { genId, BizError } from '../util.js'
 
 export class PurchaseService {
-  constructor(k, audit, inventory) {
+  constructor(k, audit, inventory, locks) {
     this.k = k
     this.audit = audit
     this.inventory = inventory
+    this.locks = locks
   }
 
   requireOrder(poId) {
@@ -119,65 +120,69 @@ export class PurchaseService {
   }
 
   // 分批验收入库（approved/receiving；实收 >0 且累计不超审批数量；幂等 effectId 防重复入账）
+  // 并发安全：同一采购单的验收按锁串行，锁内重读单据再做超量校验——
+  // 否则两个并发批次会基于同一过期快照双双通过 OVER_INBOUND 校验，累计入库超审批数量、库存被重复抬升。
   async inbound(poId, form, ctx) {
-    const po = this.requireOrder(poId)
-    if (!['approved', 'receiving'].includes(po.status)) {
-      throw new BizError('STATE_DENIED', '仅已审批 / 验收中的采购单可验收入库', 409)
-    }
-    const qty = Math.floor(Number(form.qty) || 0)
-    if (qty <= 0) throw new BizError('BAD_FORM', '本次验收数量需为正整数')
-    const remain = po.qty - po.inboundQty
-    if (qty > remain) {
-      throw new BizError('OVER_INBOUND', `本次验收 ${qty} 超过待收数量 ${remain}（审批 ${po.qty}，已收 ${po.inboundQty}）`, 409)
-    }
-    const t = this.targetOf(po.targetType, po.activityId, po.targetId)
-    const target = this.inventory.targetOf(po.targetType, po.activityId, po.targetId)
-    const traceId = this.k.newTraceId()
-    const batchId = genId('pb')
-    const before = t.row.remain
-    // 幂等：同一批次 id 的库存抬升只生效一次（崩溃重放/重复提交安全）
-    await this.inventory.receive(target, qty, `po-inbound:${batchId}`)
-    const after = this.k.state.purchaseOrders.find((x) => x.id === po.id)
-    const done = after.inboundQty + qty >= po.qty
-    const batch = {
-      id: batchId, poId: po.id, poNo: po.poNo,
-      tenantId: po.tenantId, traceId,
-      targetType: po.targetType, activityId: po.activityId, targetId: po.targetId,
-      targetName: po.targetName, icon: po.icon,
-      qty, remainBefore: before, remainAfter: before + qty,
-      stockBefore: t.row.stock - qty, stockAfter: t.row.stock,
-      carrier: (form.carrier || '').trim(),
-      inspector: ctx.name, acceptedInbound: true,
-      date: this.k.todayDate(), time: this.k.nowTime(), ts: this.k.nowTs(),
-      note: (form.note || '').trim()
-    }
-    const row = {
-      ...after,
-      inboundQty: after.inboundQty + qty,
-      status: done ? 'received' : 'receiving',
-      receivedAt: done ? `${this.k.todayDate()} ${this.k.nowTime()}` : after.receivedAt,
-      batches: [...(after.batches || []), batchId]
-    }
-    await this.k.commit([
-      { type: 'insert', table: 'inboundBatches', row: batch },
-      { type: 'upsert', table: 'purchaseOrders', row }
-    ])
-    await this.audit.log('purchase-inbound', po.id,
-      `采购验收入库【${po.targetName}】本批 +${qty}（待收余 ${po.qty - row.inboundQty}），库存 ${before}→${before + qty}` +
-      (done ? '；采购单已全部入库完成' : '，剩余批次待验收') +
-      (batch.carrier ? `；供应商/承运：${batch.carrier}` : ''),
-      { tenantId: po.tenantId, ctx, traceId })
-
-    // 缺货补发联动：全部入完且关联待补货售后时，提示从待处理售后继续履约
-    let resumeReady = null
-    if (done && po.afterSaleId) {
-      resumeReady = this.k.state.afterSales.find((a) => a.id === po.afterSaleId && a.status === 'waiting_stock') || null
-      if (resumeReady) {
-        await this.audit.log('aftersale-resume-ready', resumeReady.id,
-          `采购 ${po.poNo} 验收入库完成，待补货售后单【${resumeReady.targetName}】库存已就绪，可从待处理售后继续补发履约`,
-          { tenantId: po.tenantId, ctx, traceId })
+    return this.locks.run(`po-inbound:${poId}`, async () => {
+      const po = this.requireOrder(poId)
+      if (!['approved', 'receiving'].includes(po.status)) {
+        throw new BizError('STATE_DENIED', '仅已审批 / 验收中的采购单可验收入库', 409)
       }
-    }
-    return { batch, order: row, resumeReady }
+      const qty = Math.floor(Number(form.qty) || 0)
+      if (qty <= 0) throw new BizError('BAD_FORM', '本次验收数量需为正整数')
+      const remain = po.qty - po.inboundQty
+      if (qty > remain) {
+        throw new BizError('OVER_INBOUND', `本次验收 ${qty} 超过待收数量 ${remain}（审批 ${po.qty}，已收 ${po.inboundQty}）`, 409)
+      }
+      const t = this.targetOf(po.targetType, po.activityId, po.targetId)
+      const target = this.inventory.targetOf(po.targetType, po.activityId, po.targetId)
+      const traceId = this.k.newTraceId()
+      const batchId = genId('pb')
+      const before = t.row.remain
+      // 幂等：同一批次 id 的库存抬升只生效一次（崩溃重放/重复提交安全）
+      await this.inventory.receive(target, qty, `po-inbound:${batchId}`)
+      const after = this.k.state.purchaseOrders.find((x) => x.id === po.id)
+      const done = after.inboundQty + qty >= po.qty
+      const batch = {
+        id: batchId, poId: po.id, poNo: po.poNo,
+        tenantId: po.tenantId, traceId,
+        targetType: po.targetType, activityId: po.activityId, targetId: po.targetId,
+        targetName: po.targetName, icon: po.icon,
+        qty, remainBefore: before, remainAfter: before + qty,
+        stockBefore: t.row.stock - qty, stockAfter: t.row.stock,
+        carrier: (form.carrier || '').trim(),
+        inspector: ctx.name, acceptedInbound: true,
+        date: this.k.todayDate(), time: this.k.nowTime(), ts: this.k.nowTs(),
+        note: (form.note || '').trim()
+      }
+      const row = {
+        ...after,
+        inboundQty: after.inboundQty + qty,
+        status: done ? 'received' : 'receiving',
+        receivedAt: done ? `${this.k.todayDate()} ${this.k.nowTime()}` : after.receivedAt,
+        batches: [...(after.batches || []), batchId]
+      }
+      await this.k.commit([
+        { type: 'insert', table: 'inboundBatches', row: batch },
+        { type: 'upsert', table: 'purchaseOrders', row }
+      ])
+      await this.audit.log('purchase-inbound', po.id,
+        `采购验收入库【${po.targetName}】本批 +${qty}（待收余 ${po.qty - row.inboundQty}），库存 ${before}→${before + qty}` +
+        (done ? '；采购单已全部入库完成' : '，剩余批次待验收') +
+        (batch.carrier ? `；供应商/承运：${batch.carrier}` : ''),
+        { tenantId: po.tenantId, ctx, traceId })
+
+      // 缺货补发联动：全部入完且关联待补货售后时，提示从待处理售后继续履约
+      let resumeReady = null
+      if (done && po.afterSaleId) {
+        resumeReady = this.k.state.afterSales.find((a) => a.id === po.afterSaleId && a.status === 'waiting_stock') || null
+        if (resumeReady) {
+          await this.audit.log('aftersale-resume-ready', resumeReady.id,
+            `采购 ${po.poNo} 验收入库完成，待补货售后单【${resumeReady.targetName}】库存已就绪，可从待处理售后继续补发履约`,
+            { tenantId: po.tenantId, ctx, traceId })
+        }
+      }
+      return { batch, order: row, resumeReady }
+    })
   }
 }
